@@ -18,7 +18,7 @@ import (
 	"google.golang.org/api/gmail/v1"
 
 	"gopkg.in/mgo.v2"
-//	"gopkg.in/mgo.v2/bson"
+	"gopkg.in/mgo.v2/bson"
 )
 
 // getClient uses a Context and Config to retrieve a Token
@@ -105,10 +105,14 @@ type Label struct {
 	Name string
 }
 
+const database string = "gmail"
+const labelCollection string = "labels"
+const messageCollection string = "messages"
+
 // reInitCollectionForLabels creates collection "labels" in "gmail" database
 // and creates indexes
 func reInitCollectionForLabels(session *mgo.Session) (*mgo.Collection) {
-	lc := session.DB("gmail").C("labels")
+	lc := session.DB(database).C(labelCollection)
 	err := lc.DropCollection()
 	index := mgo.Index{
 		Key: [] string{"id"},
@@ -116,7 +120,7 @@ func reInitCollectionForLabels(session *mgo.Session) (*mgo.Collection) {
 	}
 	err = lc.EnsureIndex(index)
 	if err != nil {
-		log.Fatalf("Can't create index for 'labels' collection: %v", err)
+		log.Fatalf("Can't create index for '%s' collection: %v", labelCollection, err)
 	}
 	return lc
 }
@@ -124,7 +128,7 @@ func reInitCollectionForLabels(session *mgo.Session) (*mgo.Collection) {
 // reInitCollectionForMessages creates collection "messages" in "gmail" database
 // and creates indexes
 func reInitCollectionForMessages(session *mgo.Session) (*mgo.Collection) {
-	mc := session.DB("gmail").C("messages1")
+	mc := session.DB(database).C(messageCollection)
 	err := mc.DropCollection()
 	index := mgo.Index{
 		Key: [] string{"id"},
@@ -132,14 +136,14 @@ func reInitCollectionForMessages(session *mgo.Session) (*mgo.Collection) {
 	}
 	err = mc.EnsureIndex(index)
 	if err != nil {
-		log.Fatalf("Can't create index for 'labels' collection: %v", err)
+		log.Fatalf("Can't create index for '%s' collection: %v", messageCollection, err)
 	}
 	index = mgo.Index {
 		Key: [] string{"Processed"},
 	}
 	err = mc.EnsureIndex(index)
 	if err != nil {
-		log.Fatalf("Can't create index for 'labels' collection: %v", err)
+		log.Fatalf("Can't create index for '%s' collection: %v", messageCollection, err)
 	}
 	return mc
 }
@@ -198,6 +202,41 @@ func importMessages(srv *gmail.Service, session *mgo.Session) {
 	}
 }
 
+func processMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) {
+	user := "me"
+	mCollection := session.DB(database).C(messageCollection)
+	for messageId := range in {
+		message, err := srv.Users.Messages.Get(user, messageId).Fields("labelIds,sizeEstimate").Do()
+		if err != nil {
+			fmt.Printf("Retrive message error: %v", err)
+			return
+		}
+		err = mCollection.Update(bson.M{"id": messageId}, bson.M{"$set": bson.M{"processed": true, "SizeEstimate": message.SizeEstimate, "labelids": message.LabelIds}})
+		if err != nil {
+			fmt.Printf("Can't update message info: %v", err)
+		}
+	}
+}
+
+func processMessages(srv *gmail.Service, session *mgo.Session) {
+	flagContinue := true
+	var messages []Message
+	messagesCollection := session.DB(database).C(messageCollection)
+	out := make(chan string)
+	go processMessage(srv, session, out)
+	for flagContinue {
+		err := messagesCollection.Find(bson.M{"processed": false}).Limit(10).All(&messages)
+		if err != nil {
+			log.Fatalf("Can't get messages for process: %v", err)
+		}
+		for _, m := range messages {
+			fmt.Printf("%v\n", m)
+			out <- m.Id
+		}
+		flagContinue = false
+	}
+}
+
 // getMongoDBConnection init MongoDB connection
 func getMongoDBConnection() (*mgo.Session, error)  {
 	session, err := mgo.Dial("10.211.55.5")
@@ -230,12 +269,16 @@ func main() {
 
 	flagImportLabels := flag.Bool("importLabels", false, "Import Labels from GMail")
 	flagImportMessages := flag.Bool("importMessages", false, "Import Messages from GMail")
+	flagProcessMessages := flag.Bool("processMessages", false, "Process Messages (Collect sizes)")
 	flag.Parse()
 	if *flagImportLabels {
 		importLabels(srv, session)
 	}
 	if *flagImportMessages {
 		importMessages(srv, session)
+	}
+	if *flagProcessMessages {
+		processMessages(srv, session)
 	}
 //	fmt.Printf("%s\n", message.Id)
 //	rM, err := srv.Users.Messages.Get(user, message.Id).Fields("sizeEstimate").Do()
