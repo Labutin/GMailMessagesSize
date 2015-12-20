@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"time"
+	"strconv"
 	"flag"
 	"io/ioutil"
 	"log"
@@ -97,7 +99,7 @@ type Message struct {
 	Id string
 	LabelIds []string
 	Processed bool
-
+	InternalDate time.Time
 }
 
 type Label struct {
@@ -129,17 +131,31 @@ func reInitCollectionForLabels(session *mgo.Session) (*mgo.Collection) {
 // and creates indexes
 func reInitCollectionForMessages(session *mgo.Session) (*mgo.Collection) {
 	mc := session.DB(database).C(messageCollection)
-	err := mc.DropCollection()
+//	err := mc.DropCollection()
 	index := mgo.Index{
 		Key: [] string{"id"},
 		Unique: true,
+	}
+	err := mc.EnsureIndex(index)
+	if err != nil {
+		log.Fatalf("Can't create index for '%s' collection: %v", messageCollection, err)
+	}
+	index = mgo.Index {
+		Key: [] string{"processed"},
 	}
 	err = mc.EnsureIndex(index)
 	if err != nil {
 		log.Fatalf("Can't create index for '%s' collection: %v", messageCollection, err)
 	}
 	index = mgo.Index {
-		Key: [] string{"Processed"},
+		Key: [] string{"internaldate"},
+	}
+	err = mc.EnsureIndex(index)
+	if err != nil {
+		log.Fatalf("Can't create index for '%s' collection: %v", messageCollection, err)
+	}
+	index = mgo.Index {
+		Key: [] string{"labelids"},
 	}
 	err = mc.EnsureIndex(index)
 	if err != nil {
@@ -169,24 +185,49 @@ func importLabels(srv *gmail.Service, session *mgo.Session) {
 	fmt.Printf("Imported labels: %d\n", len(r.Labels))
 }
 
+// findLastImportedDay finds date of last message and minus 2 days
+func findLastImportedDay(session *mgo.Session) (string) {
+	mc := session.DB(database).C(messageCollection)
+	lastMessage := new (Message)
+	err := mc.Find(nil).Sort("-internaldate").One(&lastMessage)
+	if err != nil {
+		if err.Error() == "not found" {
+			lastMessage.InternalDate = time.Date(1900, time.January, 1, 1, 0, 0, 0, time.UTC)
+		} else {
+			log.Fatalf("%v", err)
+		}
+	}
+	lastDateMinus2Days := lastMessage.InternalDate.Add(time.Duration(-48) * time.Hour)
+	lastDateMinus2DaysStr :=strconv.Itoa(
+		lastDateMinus2Days.Year()) +
+		"/" + strconv.Itoa(int(lastDateMinus2Days.Month())) +
+		"/" + strconv.Itoa(lastDateMinus2Days.Day())
+	return lastDateMinus2DaysStr
+}
+
 // importMessages get Messages list from GMail and store its in "Messages" collection
 // Doesn't collect info about messages (only messages ids)
 func importMessages(srv *gmail.Service, session *mgo.Session) {
 	user := "me"
-	r, err := srv.Users.Messages.List(user).IncludeSpamTrash(true).Do()
+	importFromDate := findLastImportedDay(session)
+	r, err := srv.Users.Messages.List(user).IncludeSpamTrash(true).Q("newer:"+importFromDate).Do()
 	if err != nil {
 		log.Fatalf("Unable to retrieve messages. %v", err)
 	}
 	var messageToInsert = new(Message)
 	messageToInsert.Processed = false
+	messageToInsert.InternalDate = time.Date(1900, time.January, 1, 1, 0, 0, 0, time.UTC)
 	count := 0
 	mc := reInitCollectionForMessages(session)
 	for (len(r.Messages) > 0) {
 		for _, message := range r.Messages {
+//			fmt.Printf("%+v\n", message);
 			messageToInsert.Id = message.Id
 			err = mc.Insert(&messageToInsert)
 			if err != nil {
-				log.Fatalf("Can't insert message: %v", err)
+				if (!mgo.IsDup(err)) {
+					log.Fatalf("Can't insert message: %v", err)
+				}
 			}
 		}
 		count += len(r.Messages)
@@ -194,9 +235,9 @@ func importMessages(srv *gmail.Service, session *mgo.Session) {
 		if r.NextPageToken == "" {
 			break
 		}	else {
-			r, err = srv.Users.Messages.List(user).IncludeSpamTrash(true).PageToken(r.NextPageToken).Do()
+			r, err = srv.Users.Messages.List(user).IncludeSpamTrash(true).PageToken(r.NextPageToken).Q("newer:"+importFromDate).Do()
 			if err != nil {
-				log.Fatalf("Can't list messages: %v", err)
+				log.Fatalf("Can't list messages: %v\n", err)
 			}
 		}
 	}
@@ -206,34 +247,60 @@ func processMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) 
 	user := "me"
 	mCollection := session.DB(database).C(messageCollection)
 	for messageId := range in {
-		message, err := srv.Users.Messages.Get(user, messageId).Fields("labelIds,sizeEstimate").Do()
+		fmt.Print(".")
+		message, err := srv.Users.Messages.Get(user, messageId).Fields("internalDate,labelIds,sizeEstimate").Do()
 		if err != nil {
-			fmt.Printf("Retrive message error: %v", err)
-			return
-		}
-		err = mCollection.Update(bson.M{"id": messageId}, bson.M{"$set": bson.M{"processed": true, "SizeEstimate": message.SizeEstimate, "labelids": message.LabelIds}})
-		if err != nil {
-			fmt.Printf("Can't update message info: %v", err)
+			if (err.Error() == "googleapi: Error 404: Not Found, notFound") {
+				err = mCollection.Remove(bson.M{"id": messageId})
+				fmt.Print("NF")
+				if err != nil {
+					fmt.Printf("Can't dete message info: %v\n", err)
+				}
+			}else {
+				fmt.Printf("Retrive message error: %v\n", err)
+				return
+			}
+		} else {
+			err = mCollection.Update(bson.M{"id": messageId}, bson.M{"$set":
+				bson.M{
+					"processed": true,
+					"SizeEstimate": message.SizeEstimate,
+					"labelids": message.LabelIds,
+					"internaldate": time.Unix(message.InternalDate / 1000, 0)}})
+			if err != nil {
+				log.Fatalf("Can't update message info: %v\n", err)
+			}
 		}
 	}
 }
 
-func processMessages(srv *gmail.Service, session *mgo.Session) {
+func processMessages(srv *gmail.Service, session *mgo.Session, procNum int) {
+	if (procNum < 1 || procNum > 50) {
+		log.Fatal("Wrong procNum. Min=1 Max=50")
+	}
 	flagContinue := true
 	var messages []Message
 	messagesCollection := session.DB(database).C(messageCollection)
 	out := make(chan string)
-	go processMessage(srv, session, out)
+	for i:= 0; i < procNum; i++ {
+		go processMessage(srv, session, out)
+	}
+	count := 0
 	for flagContinue {
-		err := messagesCollection.Find(bson.M{"processed": false}).Limit(10).All(&messages)
+		err := messagesCollection.Find(bson.M{"processed": false}).Limit(100).All(&messages)
 		if err != nil {
 			log.Fatalf("Can't get messages for process: %v", err)
 		}
 		for _, m := range messages {
-			fmt.Printf("%v\n", m)
 			out <- m.Id
 		}
-		flagContinue = false
+		count += len(messages)
+		if count % 100 == 0 {
+			fmt.Printf("Procecced %d messages\n", count)
+		}
+		if len(messages) == 0 {
+			flagContinue = false
+		}
 	}
 }
 
@@ -270,6 +337,7 @@ func main() {
 	flagImportLabels := flag.Bool("importLabels", false, "Import Labels from GMail")
 	flagImportMessages := flag.Bool("importMessages", false, "Import Messages from GMail")
 	flagProcessMessages := flag.Bool("processMessages", false, "Process Messages (Collect sizes)")
+	procNum := flag.Int("procNum", 1, "Number councurrent processes")
 	flag.Parse()
 	if *flagImportLabels {
 		importLabels(srv, session)
@@ -278,7 +346,7 @@ func main() {
 		importMessages(srv, session)
 	}
 	if *flagProcessMessages {
-		processMessages(srv, session)
+		processMessages(srv, session, *procNum)
 	}
 //	fmt.Printf("%s\n", message.Id)
 //	rM, err := srv.Users.Messages.Get(user, message.Id).Fields("sizeEstimate").Do()
