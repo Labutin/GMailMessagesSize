@@ -250,15 +250,19 @@ func processMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) 
 		fmt.Print(".")
 		message, err := srv.Users.Messages.Get(user, messageId).Fields("internalDate,labelIds,sizeEstimate").Do()
 		if err != nil {
-			if (err.Error() == "googleapi: Error 404: Not Found, notFound") {
+			switch err.Error() {
+			default:
+				fmt.Printf("Retrive message error: %v\n", err)
+				return
+			case "googleapi: Error 403: User Rate Limit Exceeded, userRateLimitExceeded":
+				fmt.Print("S")
+				time.Sleep(5 * time.Second)
+			case "googleapi: Error 404: Not Found, notFound":
 				err = mCollection.Remove(bson.M{"id": messageId})
 				fmt.Print("NF")
 				if err != nil {
 					fmt.Printf("Can't dete message info: %v\n", err)
 				}
-			}else {
-				fmt.Printf("Retrive message error: %v\n", err)
-				return
 			}
 		} else {
 			err = mCollection.Update(bson.M{"id": messageId}, bson.M{"$set":
