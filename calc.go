@@ -243,6 +243,7 @@ func importMessages(srv *gmail.Service, session *mgo.Session) {
 	}
 }
 
+// processMessage Get information about messages gotten from input chan
 func processMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) {
 	user := "me"
 	mCollection := session.DB(database).C(messageCollection)
@@ -278,6 +279,7 @@ func processMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) 
 	}
 }
 
+// processMessages Process all messages in queue (processed==false)
 func processMessages(srv *gmail.Service, session *mgo.Session, procNum int) {
 	if (procNum < 1 || procNum > 50) {
 		log.Fatal("Wrong procNum. Min=1 Max=50")
@@ -305,6 +307,41 @@ func processMessages(srv *gmail.Service, session *mgo.Session, procNum int) {
 		if len(messages) == 0 {
 			flagContinue = false
 		}
+	}
+}
+
+func showLabelSize(session *mgo.Session, labelId string) {
+	messagesCollection := session.DB(database).C(messageCollection)
+	labelsCollection := session.DB(database).C(labelCollection)
+	label := new(Label)
+	labelsCollection.Find(bson.M{"id": labelId}).One(&label)
+	fmt.Printf("%s;", label.Name)
+	res := bson.M{}
+	err := messagesCollection.Pipe([]bson.M{
+		{"$match": bson.M{"labelids": labelId}},
+		{"$group": bson.M{"_id": nil,
+			"sum": bson.M{"$sum": "$SizeEstimate"},
+			"count": bson.M{"$sum": 1}}}}).One(&res)
+	if err != nil {
+		if err.Error() == "not found" {
+			res["sum"] = 0
+			res["count"] = 0
+		}else {
+			log.Fatalf("Can't calculate Label size: %v", err)
+		}
+	}
+	fmt.Printf("%d;%d\n", res["sum"], res["count"])
+}
+
+func showLabelSizes(session *mgo.Session) {
+	labelsCollection := session.DB(database).C(labelCollection)
+	var labels []Label
+	err := labelsCollection.Find(nil).Sort("name").All(&labels)
+	if err != nil {
+		log.Fatalf("Can't get Labels list: %v", err)
+	}
+	for _, label := range labels {
+		showLabelSize(session, label.Id)
 	}
 }
 
@@ -341,6 +378,7 @@ func main() {
 	flagImportLabels := flag.Bool("importLabels", false, "Import Labels from GMail")
 	flagImportMessages := flag.Bool("importMessages", false, "Import Messages from GMail")
 	flagProcessMessages := flag.Bool("processMessages", false, "Process Messages (Collect sizes)")
+	flagShowSizes := flag.Bool("showSizes", false, "Show Labels sizes")
 	procNum := flag.Int("procNum", 1, "Number councurrent processes")
 	flag.Parse()
 	if *flagImportLabels {
@@ -351,6 +389,9 @@ func main() {
 	}
 	if *flagProcessMessages {
 		processMessages(srv, session, *procNum)
+	}
+	if *flagShowSizes {
+		showLabelSizes(session)
 	}
 //	fmt.Printf("%s\n", message.Id)
 //	rM, err := srv.Users.Messages.Get(user, message.Id).Fields("sizeEstimate").Do()
