@@ -101,10 +101,11 @@ func saveToken(file string, token *oauth2.Token) {
 }
 
 type Message struct {
-	Id string
-	LabelIds []string
-	Processed bool
+	Id           string
+	LabelIds     []string
+	Processed    bool
 	InternalDate time.Time
+	SizeEstimate int "SizeEstimate"
 }
 
 type Label struct {
@@ -311,7 +312,18 @@ func processMessages(srv *gmail.Service, session *mgo.Session, procNum int) {
 	}
 }
 
-func showLabelSize(session *mgo.Session, labelIds []string) {
+func createFindBSON(labelIds stringslice, flagOnlyThisLabel bool) (bson.M) {
+	lIdsQuery := bson.M{}
+	if (len(labelIds) == 1 && !flagOnlyThisLabel){
+		lIdsQuery = bson.M{"$in": labelIds}
+	}else {
+		lIdsQuery = bson.M{"$all": labelIds, "$size": len(labelIds)}
+	}
+	return bson.M{"labelids": lIdsQuery}
+}
+
+// showLabelSize print information about current label
+func showLabelSize(session *mgo.Session, labelIds []string, flagOnlyThisLabel bool) {
 	messagesCollection := session.DB(database).C(messageCollection)
 	labelsCollection := session.DB(database).C(labelCollection)
 	var labels []Label
@@ -337,14 +349,9 @@ func showLabelSize(session *mgo.Session, labelIds []string) {
 	}
 	fmt.Print(";")
 	res := bson.M{}
-	lIdsQuery := bson.M{}
-	if len(labelIds) == 1 {
-		lIdsQuery = bson.M{"$in": labelIds}
-	}else {
-		lIdsQuery = bson.M{"$all": labelIds, "$size": len(labelIds)}
-	}
+	lIdsQuery := createFindBSON(labelIds, flagOnlyThisLabel)
 	err := messagesCollection.Pipe([]bson.M{
-		{"$match": bson.M{"labelids": lIdsQuery}},
+		{"$match": lIdsQuery},
 		{"$group": bson.M{"_id": nil,
 			"sum": bson.M{"$sum": "$SizeEstimate"},
 			"count": bson.M{"$sum": 1}}}}).One(&res)
@@ -359,7 +366,9 @@ func showLabelSize(session *mgo.Session, labelIds []string) {
 	fmt.Printf("%d;%d\n", res["sum"], res["count"])
 }
 
-func showLabelSizes(session *mgo.Session) {
+
+// showLabelSizes print information about selected labels
+func showLabelSizes(session *mgo.Session, flagOnlyThisLabel bool) {
 	labelsCollection := session.DB(database).C(labelCollection)
 	var labels []Label
 	var err error
@@ -373,11 +382,70 @@ func showLabelSizes(session *mgo.Session) {
 	fmt.Print("LabelId;Label name;Messages size;Messages count\n")
 	if len(labelsFlag) == 0 {
 		for _, label := range labels {
-			showLabelSize(session, []string{label.Id})
+			showLabelSize(session, []string{label.Id}, flagOnlyThisLabel)
 		}
 	}else{
-		showLabelSize(session, labelsFlag)
+		showLabelSize(session, labelsFlag, flagOnlyThisLabel)
 	}
+}
+
+func deleteMessage(srv *gmail.Service, session *mgo.Session, in <-chan string) {
+	messagesCollection := session.DB(database).C(messageCollection)
+	user := "me"
+	for messageId := range in {
+		fmt.Printf("%s\n", messageId)
+		_, err := srv.Users.Messages.Trash(user, messageId).Do()
+		delete := true
+		if err != nil {
+			switch err.Error() {
+			default:
+				fmt.Printf("Can't delete message: %v\n", err)
+				return
+			case "googleapi: Error 403: User Rate Limit Exceeded, userRateLimitExceeded":
+				fmt.Print("S")
+				time.Sleep(5 * time.Second)
+				delete = false
+			case "googleapi: Error 404: Not Found, notFound":
+				fmt.Print("NF")
+			}
+		}
+		if delete {
+			errMongo := messagesCollection.Remove(bson.M{"id": messageId})
+			if errMongo != nil {
+				log.Fatalf("Can't delete message from MongoDB: %v", errMongo)
+			}
+		}
+	}
+}
+
+
+// deleteMessages deletes delected messages
+func deleteMessages(srv *gmail.Service, session *mgo.Session, labelIds stringslice, flagOnlyThisLabel bool, procNum int) {
+	if len(labelsFlag) == 0 && !flagOnlyThisLabel {
+		log.Fatal("ERROR!!! With this params you will delete ALL messages!\nExecution stoped!")
+		os.Exit(1)
+	}
+	lIdsQuery := createFindBSON(labelIds, flagOnlyThisLabel)
+	var messages []Message
+	messagesCollection := session.DB(database).C(messageCollection)
+	err := messagesCollection.Find(lIdsQuery).All(&messages)
+	if err != nil {
+		log.Fatalf("Can't get messages for delete: %v", err)
+	}
+	deletedSize := 0
+	if (procNum < 1 || procNum > 50) {
+		log.Fatal("Wrong procNum. Min=1 Max=50")
+	}
+	out := make(chan string)
+	for i:= 0; i < procNum; i++ {
+		go deleteMessage(srv, session, out)
+	}
+
+	for _, message := range messages {
+		out <- message.Id
+		deletedSize += message.SizeEstimate
+	}
+	fmt.Printf("\n---------------\nDeleted %d messages (%d bytes)\n", len(messages), deletedSize)
 }
 
 // getMongoDBConnection init MongoDB connection
@@ -410,7 +478,7 @@ func main() {
 		log.Fatalf("Unable to read client secret file: %v", err)
 	}
 
-	config, err := google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
+	config, err := google.ConfigFromJSON(b, gmail.MailGoogleComScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
@@ -425,9 +493,11 @@ func main() {
 	flagImportMessages := flag.Bool("importMessages", false, "Import Messages from GMail")
 	flagProcessMessages := flag.Bool("processMessages", false, "Process Messages (Collect sizes)")
 	flagShowSizes := flag.Bool("showSizes", false, "Show Labels sizes")
-	procNum := flag.Int("procNum", 1, "Number councurrent processes")
-	flagMongoConnectString := flag.String("mongoConnectString", "127.0.0.1", "Mongo connection string")
+	procNum := flag.Int("procNum", 1, "Number councurrent processes (used only in -importMessages)")
+	flagMongoConnectString := flag.String("mongoConnectionString", "127.0.0.1", "Mongo connection string")
 	flag.Var(&labelsFlag, "l", "List of labels")
+	flagOnlyThisLabel := flag.Bool("onlyThisLabel", false, "Find messages only with this labels")
+	flagDeteleMessages := flag.Bool("deleteMessages", false, "Delete selected messages")
 	flag.Parse()
 	session, err := getMongoDBConnection(*flagMongoConnectString)
 	if err != nil {
@@ -444,13 +514,9 @@ func main() {
 		processMessages(srv, session, *procNum)
 	}
 	if *flagShowSizes {
-		showLabelSizes(session)
+		showLabelSizes(session, *flagOnlyThisLabel)
 	}
-//	fmt.Printf("%s\n", message.Id)
-//	rM, err := srv.Users.Messages.Get(user, message.Id).Fields("sizeEstimate").Do()
-//	if err == nil {
-//		fmt.Printf("%+v\n", rM);
-//	}else {
-//		log.Fatalf("Unable to retrieve message. %v", err)
-//	}
+	if *flagDeteleMessages {
+		deleteMessages(srv, session, labelsFlag, *flagOnlyThisLabel, *procNum)
+	}
 }
