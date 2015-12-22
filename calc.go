@@ -23,6 +23,11 @@ import (
 	"gopkg.in/mgo.v2/bson"
 )
 
+const database string = "gmail"
+const labelCollection string = "labels"
+const messageCollection string = "messages"
+
+var labelsFlag stringslice
 // getClient uses a Context and Config to retrieve a Token
 // then generate a Client. It returns the generated Client.
 func getClient(ctx context.Context, config *oauth2.Config) *http.Client {
@@ -106,10 +111,6 @@ type Label struct {
 	Id string
 	Name string
 }
-
-const database string = "gmail"
-const labelCollection string = "labels"
-const messageCollection string = "messages"
 
 // reInitCollectionForLabels creates collection "labels" in "gmail" database
 // and creates indexes
@@ -310,15 +311,40 @@ func processMessages(srv *gmail.Service, session *mgo.Session, procNum int) {
 	}
 }
 
-func showLabelSize(session *mgo.Session, labelId string) {
+func showLabelSize(session *mgo.Session, labelIds []string) {
 	messagesCollection := session.DB(database).C(messageCollection)
 	labelsCollection := session.DB(database).C(labelCollection)
-	label := new(Label)
-	labelsCollection.Find(bson.M{"id": labelId}).One(&label)
-	fmt.Printf("%s;", label.Name)
+	var labels []Label
+	labelsCollection.Find(bson.M{"id": bson.M{"$in": labelIds}}).All(&labels)
+	first := true
+	for _, l := range labels {
+		if !first {
+			fmt.Print(",")
+		}else{
+			first = false
+		}
+		fmt.Printf("%s", l.Id)
+	}
+	fmt.Print(";")
+	first = true
+	for _, l := range labels {
+		if !first {
+			fmt.Print(",")
+		}else{
+			first = false
+		}
+		fmt.Printf("%s", l.Name)
+	}
+	fmt.Print(";")
 	res := bson.M{}
+	lIdsQuery := bson.M{}
+	if len(labelIds) == 1 {
+		lIdsQuery = bson.M{"$in": labelIds}
+	}else {
+		lIdsQuery = bson.M{"$all": labelIds, "$size": len(labelIds)}
+	}
 	err := messagesCollection.Pipe([]bson.M{
-		{"$match": bson.M{"labelids": labelId}},
+		{"$match": bson.M{"labelids": lIdsQuery}},
 		{"$group": bson.M{"_id": nil,
 			"sum": bson.M{"$sum": "$SizeEstimate"},
 			"count": bson.M{"$sum": 1}}}}).One(&res)
@@ -336,19 +362,44 @@ func showLabelSize(session *mgo.Session, labelId string) {
 func showLabelSizes(session *mgo.Session) {
 	labelsCollection := session.DB(database).C(labelCollection)
 	var labels []Label
-	err := labelsCollection.Find(nil).Sort("name").All(&labels)
+	var err error
+	err = nil
+	if len(labelsFlag) == 0 {
+		err = labelsCollection.Find(nil).Sort("name").All(&labels)
+	}
 	if err != nil {
 		log.Fatalf("Can't get Labels list: %v", err)
 	}
-	for _, label := range labels {
-		showLabelSize(session, label.Id)
+	fmt.Print("LabelId;Label name;Messages size;Messages count\n")
+	if len(labelsFlag) == 0 {
+		for _, label := range labels {
+			showLabelSize(session, []string{label.Id})
+		}
+	}else{
+		showLabelSize(session, labelsFlag)
 	}
 }
 
 // getMongoDBConnection init MongoDB connection
-func getMongoDBConnection() (*mgo.Session, error)  {
-	session, err := mgo.Dial("10.211.55.5")
+func getMongoDBConnection(connectionString string) (*mgo.Session, error)  {
+	session, err := mgo.Dial(connectionString)
 	return session, err
+}
+
+// Define a type named "intslice" as a slice of ints
+type stringslice []string
+
+// Now, for our new type, implement the two methods of
+// the flag.Value interface...
+// The first method is String() string
+func (i *stringslice) String() string {
+	return fmt.Sprintf("%s", *i)
+}
+
+// The second method is Set(value string) error
+func (i *stringslice) Set(value string) error {
+	*i = append(*i, value)
+	return nil
 }
 
 func main() {
@@ -369,18 +420,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("Unable to retrieve gmail Client %v", err)
 	}
-	session, err := getMongoDBConnection()
-	if err != nil {
-		panic(err)
-	}
-	defer session.Close()
 
 	flagImportLabels := flag.Bool("importLabels", false, "Import Labels from GMail")
 	flagImportMessages := flag.Bool("importMessages", false, "Import Messages from GMail")
 	flagProcessMessages := flag.Bool("processMessages", false, "Process Messages (Collect sizes)")
 	flagShowSizes := flag.Bool("showSizes", false, "Show Labels sizes")
 	procNum := flag.Int("procNum", 1, "Number councurrent processes")
+	flagMongoConnectString := flag.String("mongoConnectString", "127.0.0.1", "Mongo connection string")
+	flag.Var(&labelsFlag, "l", "List of labels")
 	flag.Parse()
+	session, err := getMongoDBConnection(*flagMongoConnectString)
+	if err != nil {
+		log.Fatalf("Can't connect to MongoDB: %v", err)
+	}
+	defer session.Close()
 	if *flagImportLabels {
 		importLabels(srv, session)
 	}
